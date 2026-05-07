@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "target": "ES2022",
+    "outDir": "./dist/worker",
+    "rootDir": "./worker",
+    "noEmit": false,
+    "jsx": "preserve",
+    "incremental": false
+  },
+  "include": ["worker/**/*.ts", "src/lib/env.ts", "src/lib/redis.ts", "src/lib/queue.ts"],
+  "exclude": ["node_modules"]
+}

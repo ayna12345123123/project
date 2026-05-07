@@ -1,0 +1,566 @@
+// =============================================================================
+// Linkforge — Prisma schema (v1)
+//
+// Conventions:
+//   - All money is stored in integer minor units (cents) on `_minor` columns.
+//   - Soft-delete via `deletedAt` on user-content tables (User, Page, Block).
+//   - `createdAt` / `updatedAt` on every entity for audit + ordering.
+//   - JSONB for polymorphic content (Block.content, Theme.tokens, etc.).
+//   - Indexes are defined explicitly; foreign keys cascade to keep the model
+//     consistent with soft-delete semantics.
+//   - Postgres enums are used where the value set is fixed; flags use simple
+//     booleans to avoid migrations every time we add a state.
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// -----------------------------------------------------------------------------
+//  Enums
+// -----------------------------------------------------------------------------
+
+enum UserRole {
+  USER
+  PRO
+  ADMIN
+  SUPPORT
+}
+
+enum AuthProvider {
+  CREDENTIALS
+  GOOGLE
+  GITHUB
+  TELEGRAM
+  EMAIL
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  TRIALING
+  PAST_DUE
+  CANCELED
+  INCOMPLETE
+  INCOMPLETE_EXPIRED
+  UNPAID
+}
+
+enum BlockType {
+  LINK
+  TEXT
+  BUTTON
+  IMAGE
+  VIDEO
+  EMBED
+  DIVIDER
+  SOCIAL
+  FORM
+  FAQ
+  COUNTDOWN
+  GALLERY
+  DONATION
+  PRODUCT
+  MAP
+  HEADER
+  AVATAR
+}
+
+enum AnalyticsEventType {
+  PAGE_VIEW
+  BLOCK_CLICK
+  FORM_SUBMIT
+  PRODUCT_PURCHASE
+}
+
+enum AuditAction {
+  USER_LOGIN
+  USER_LOGOUT
+  USER_REGISTER
+  USER_PASSWORD_CHANGED
+  USER_2FA_ENABLED
+  USER_2FA_DISABLED
+  USER_SUSPENDED
+  PAGE_CREATED
+  PAGE_PUBLISHED
+  PAGE_DELETED
+  CUSTOM_DOMAIN_VERIFIED
+  BILLING_SUBSCRIBED
+  BILLING_CANCELED
+  ADMIN_ACTION
+}
+
+enum WebhookEventType {
+  PAGE_PUBLISHED
+  FORM_SUBMITTED
+  PRODUCT_PURCHASED
+  SUBSCRIPTION_CHANGED
+}
+
+// -----------------------------------------------------------------------------
+//  Identity & access
+// -----------------------------------------------------------------------------
+
+model User {
+  id              String    @id @default(cuid())
+  email           String    @unique
+  emailVerifiedAt DateTime?
+  passwordHash    String?
+  name            String?
+  username        String    @unique
+  avatarUrl       String?
+  role            UserRole  @default(USER)
+  locale          String    @default("en")
+
+  twoFactorEnabled Boolean @default(false)
+  twoFactorSecret  String? // AES-GCM ciphertext
+
+  // Marketing / referral
+  referralCode      String  @unique @default(cuid())
+  referredByCode    String?
+  marketingOptIn    Boolean @default(false)
+
+  // Soft delete + audit
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+  lastSeenAt DateTime?
+
+  // Relations
+  accounts        Account[]
+  authSessions    AuthSession[]
+  recoveryCodes   RecoveryCode[]
+  pages           Page[]
+  shortLinks      ShortLink[]
+  apiKeys         ApiKey[]
+  webhooks        Webhook[]
+  subscription    Subscription?
+  auditLogs       AuditLog[]
+  contentReports  ContentReport[] @relation("Reporter")
+  reportedContent ContentReport[] @relation("Reported")
+  events          AnalyticsEvent[]
+  formSubmissions FormSubmission[]
+
+  @@index([deletedAt])
+  @@index([role])
+  @@index([referralCode])
+}
+
+// OAuth identity (one row per (provider, providerAccountId))
+model Account {
+  id                String       @id @default(cuid())
+  userId            String
+  user              User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider          AuthProvider
+  providerAccountId String
+  accessToken       String?
+  refreshToken      String?
+  expiresAt         DateTime?
+  tokenType         String?
+  scope             String?
+  idToken           String?
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+// Server-side session row (complementary to Auth.js JWT cookies).
+// Used for device listing + revocation + suspicious-login flow.
+model AuthSession {
+  id                 String   @id @default(cuid())
+  userId             String
+  user               User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshTokenHash   String   @unique
+  deviceLabel        String?
+  ip                 String?
+  country            String?
+  userAgent          String?
+  twoFactorPassedAt  DateTime?
+  requiresStepUp     Boolean  @default(false)
+  expiresAt          DateTime
+  revokedAt          DateTime?
+  createdAt          DateTime @default(now())
+  lastUsedAt         DateTime @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// One-time recovery codes for 2FA.
+model RecoveryCode {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  codeHash  String    @unique
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+// Email verification + password reset tokens.
+model VerificationToken {
+  id        String   @id @default(cuid())
+  identifier String  // email or userId, depending on purpose
+  tokenHash String   @unique
+  purpose   String   // "EMAIL_VERIFY" | "PASSWORD_RESET" | "MAGIC_LINK"
+  expiresAt DateTime
+  consumedAt DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([identifier])
+  @@index([expiresAt])
+}
+
+// -----------------------------------------------------------------------------
+//  Pages, blocks, themes
+// -----------------------------------------------------------------------------
+
+model Page {
+  id           String    @id @default(cuid())
+  userId       String
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  slug         String    @unique
+  title        String
+  description  String?
+  isPublished  Boolean   @default(false)
+  isPrivate    Boolean   @default(false)
+  passwordHash String? // for "private" pages with a password gate
+
+  version      Int       @default(1) // bumped on every save → cache key
+
+  // SEO / OG
+  ogImageUrl   String?
+  faviconUrl   String?
+  metaJson     Json?     // arbitrary metadata (twitter, og, structured)
+
+  // Theme is 1-1; convenient as embedded JSON for cheap reads
+  theme        Theme?
+
+  blocks       Block[]
+  customDomain CustomDomain?
+  shortLinks   ShortLink[]
+  events       AnalyticsEvent[]
+  forms        FormSubmission[]
+
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  deletedAt    DateTime?
+  publishedAt  DateTime?
+
+  @@index([userId])
+  @@index([deletedAt])
+  @@index([isPublished, deletedAt])
+}
+
+model Theme {
+  id        String   @id @default(cuid())
+  pageId    String   @unique
+  page      Page     @relation(fields: [pageId], references: [id], onDelete: Cascade)
+  presetKey String?  // "minimal-light", "neon", ... (see PageTemplate seed)
+  tokens    Json     // { background, accent, text, font, radius, ... }
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Block {
+  id        String    @id @default(cuid())
+  pageId    String
+  page      Page      @relation(fields: [pageId], references: [id], onDelete: Cascade)
+  type      BlockType
+  order     Int
+  hidden    Boolean   @default(false)
+
+  // Hot-path indexed columns hoisted from `content` for analytics joins
+  label     String?
+  url       String?
+
+  content   Json      // versioned block payload, see Zod schemas in code
+  styleJson Json?     // per-block style overrides
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  events AnalyticsEvent[]
+
+  @@index([pageId, order])
+  @@index([type])
+  @@index([deletedAt])
+}
+
+// -----------------------------------------------------------------------------
+//  Custom domains, short links, forms
+// -----------------------------------------------------------------------------
+
+model CustomDomain {
+  id            String    @id @default(cuid())
+  pageId        String    @unique
+  page          Page      @relation(fields: [pageId], references: [id], onDelete: Cascade)
+  domain        String    @unique
+  verifiedAt    DateTime?
+  txtVerifyKey  String    // value the user must put in the TXT record
+  certIssuedAt  DateTime?
+  certNotAfter  DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([verifiedAt])
+}
+
+model ShortLink {
+  id        String   @id @default(cuid())
+  code      String   @unique
+  url       String
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  pageId    String?
+  page      Page?    @relation(fields: [pageId], references: [id], onDelete: SetNull)
+  hits      Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([pageId])
+}
+
+model FormSubmission {
+  id        String   @id @default(cuid())
+  pageId    String
+  page      Page     @relation(fields: [pageId], references: [id], onDelete: Cascade)
+  blockId   String?  // form block id (optional snapshot)
+  ownerId   String   // page owner — denormalised for fast inbox queries
+  owner     User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  payload   Json     // { name, email, message, ... }
+  ip        String?
+  country   String?
+  userAgent String?
+  score     Int?     // lead score (0-100)
+  createdAt DateTime @default(now())
+
+  @@index([ownerId, createdAt])
+  @@index([pageId])
+}
+
+// -----------------------------------------------------------------------------
+//  Analytics
+// -----------------------------------------------------------------------------
+
+model AnalyticsEvent {
+  id        BigInt              @id @default(autoincrement())
+  pageId    String
+  page      Page                @relation(fields: [pageId], references: [id], onDelete: Cascade)
+  blockId   String?
+  block     Block?              @relation(fields: [blockId], references: [id], onDelete: SetNull)
+  ownerId   String
+  owner     User                @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  type      AnalyticsEventType
+  occurredAt DateTime           @default(now())
+
+  // Visitor dimensions (PII-light: country only, IP hashed before storage)
+  ipHash    String?
+  country   String?
+  region    String?
+  city      String?
+  device    String?
+  os        String?
+  browser   String?
+  referer   String?
+  utmSource String?
+  utmMedium String?
+  utmCampaign String?
+  utmTerm   String?
+  utmContent String?
+
+  // Visitor identity (anonymous, rotating cookie)
+  visitorId String?
+
+  meta      Json?
+
+  @@index([pageId, occurredAt])
+  @@index([ownerId, occurredAt])
+  @@index([blockId, occurredAt])
+  @@index([type, occurredAt])
+}
+
+// Pre-aggregated daily roll-ups for fast dashboards.
+model AnalyticsDaily {
+  id       String   @id @default(cuid())
+  pageId   String
+  ownerId  String
+  day      DateTime
+  views    Int      @default(0)
+  uniques  Int      @default(0)
+  clicks   Int      @default(0)
+  formSubmits Int   @default(0)
+  productSales Int  @default(0)
+  countriesJson Json? // { "US": 12, "DE": 7 }
+  devicesJson   Json? // { "mobile": 30, "desktop": 5 }
+
+  @@unique([pageId, day])
+  @@index([ownerId, day])
+}
+
+// -----------------------------------------------------------------------------
+//  Billing
+// -----------------------------------------------------------------------------
+
+model Subscription {
+  id                 String             @id @default(cuid())
+  userId             String             @unique
+  user               User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  stripeCustomerId   String?            @unique
+  stripeSubscriptionId String?          @unique
+  status             SubscriptionStatus @default(ACTIVE)
+  plan               String             // "PRO_MONTHLY" | "PRO_YEARLY"
+  priceMinor         Int                @default(0)
+  currency           String             @default("USD")
+  currentPeriodStart DateTime?
+  currentPeriodEnd   DateTime?
+  cancelAt           DateTime?
+  trialEnd           DateTime?
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+}
+
+model Coupon {
+  id            String    @id @default(cuid())
+  code          String    @unique
+  description   String?
+  percentOff    Int?
+  amountOffMinor Int?
+  currency      String    @default("USD")
+  expiresAt     DateTime?
+  maxRedemptions Int?
+  redemptions   Int      @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+model Referral {
+  id          String   @id @default(cuid())
+  code        String   @unique
+  ownerId     String
+  redeemedById String?
+  rewardJson  Json? // { kind: "MRR_30PCT", until: "2027-..." }
+  createdAt   DateTime @default(now())
+}
+
+// -----------------------------------------------------------------------------
+//  API keys + webhooks
+// -----------------------------------------------------------------------------
+
+model ApiKey {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name        String
+  prefix      String   // visible 8-char prefix for display
+  keyHash     String   @unique
+  scopes      String[] // e.g. ["pages:read", "analytics:read"]
+  lastUsedAt  DateTime?
+  expiresAt   DateTime?
+  revokedAt   DateTime?
+  createdAt   DateTime @default(now())
+
+  @@index([userId])
+}
+
+model Webhook {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  url       String
+  secret    String   // for HMAC signing
+  events    WebhookEventType[]
+  active    Boolean  @default(true)
+  failureCount Int  @default(0)
+  lastErrorAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+}
+
+model WebhookDelivery {
+  id          String   @id @default(cuid())
+  webhookId   String
+  eventType   WebhookEventType
+  payload     Json
+  statusCode  Int?
+  responseBody String?
+  attempt     Int      @default(0)
+  deliveredAt DateTime?
+  createdAt   DateTime @default(now())
+
+  @@index([webhookId, createdAt])
+}
+
+// -----------------------------------------------------------------------------
+//  Admin / moderation
+// -----------------------------------------------------------------------------
+
+model AuditLog {
+  id        String      @id @default(cuid())
+  userId    String?
+  user      User?       @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action    AuditAction
+  targetId  String?
+  ip        String?
+  userAgent String?
+  meta      Json?
+  createdAt DateTime    @default(now())
+
+  @@index([userId])
+  @@index([action, createdAt])
+}
+
+model ContentReport {
+  id          String   @id @default(cuid())
+  reporterId  String
+  reporter    User     @relation("Reporter", fields: [reporterId], references: [id], onDelete: Cascade)
+  reportedUserId String?
+  reportedUser User?   @relation("Reported", fields: [reportedUserId], references: [id], onDelete: SetNull)
+  pageId      String?
+  reason      String
+  details     String?
+  status      String   @default("OPEN") // OPEN | RESOLVED | DISMISSED
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([status])
+  @@index([reportedUserId])
+}
+
+model FeatureFlag {
+  key       String   @id
+  enabled   Boolean  @default(false)
+  rollout   Int      @default(0) // 0..100 percentage
+  payload   Json?
+  updatedAt DateTime @updatedAt
+}
+
+model PageTemplate {
+  id          String   @id @default(cuid())
+  key         String   @unique
+  name        String
+  description String?
+  thumbnail   String?
+  isPro       Boolean  @default(false)
+  blocksJson  Json     // pre-baked array of blocks
+  themeJson   Json     // theme tokens
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model ReservedSlug {
+  slug      String   @id
+  reason    String?
+  createdAt DateTime @default(now())
+}
