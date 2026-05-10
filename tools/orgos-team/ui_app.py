@@ -30,10 +30,11 @@ from typing import Any
 import streamlit as st
 
 from orgos.config import Config
-from orgos.demo_client import DemoLLMClient
+from orgos.demo_client import DemoLLMClient, DemoTestRunner
 from orgos.llm import LLMClient, LLMError
 from orgos.output import git_init_and_commit, write_project
-from orgos.schemas import Finding, GeneratedFile, Plan, Spec
+from orgos.schemas import Finding, GeneratedFile, Plan, Spec, TestRunResult
+from orgos.test_runner import TestRunner
 from orgos.workflow import run_workflow
 
 
@@ -79,6 +80,7 @@ def _worker_target(
     idea: str,
     do_git_init: bool,
     demo_mode: bool,
+    auto_execute_tests: bool,
     event_q: "queue.Queue[tuple[str, Any]]",
 ) -> None:
     """Run the async workflow in a background thread.
@@ -86,6 +88,10 @@ def _worker_target(
     If ``demo_mode`` is True, swap in :class:`DemoLLMClient` so we never
     touch the network. Everything downstream — Chief, agents, schemas,
     output writer — is unchanged.
+
+    If ``auto_execute_tests`` is True, also wire in a test runner. In
+    demo mode that's :class:`DemoTestRunner` (instant pass); otherwise
+    it's the real :class:`TestRunner` that spawns an isolated venv.
     """
 
     def progress(event: str, detail: str) -> None:
@@ -93,12 +99,15 @@ def _worker_target(
 
     async def _go() -> dict[str, Any]:
         client: Any
+        runner: Any | None
         if demo_mode:
             client = DemoLLMClient()
+            runner = DemoTestRunner() if auto_execute_tests else None
         else:
             client = LLMClient(config)
+            runner = TestRunner() if auto_execute_tests else None
         try:
-            return await run_workflow(client, idea, progress)
+            return await run_workflow(client, idea, progress, test_runner=runner)
         finally:
             await client.close()
 
@@ -116,6 +125,8 @@ def _worker_target(
         )
         findings: list[Finding] = final_state.get("findings", [])
         notes = final_state.get("notes", [])
+        test_run: TestRunResult | None = final_state.get("test_run")
+        test_findings: list[Finding] = final_state.get("test_findings", [])
 
         project_root = write_project(
             output_root=config.output_dir,
@@ -139,6 +150,8 @@ def _worker_target(
                     "findings": findings,
                     "notes": notes,
                     "project_root": str(project_root),
+                    "test_run": test_run,
+                    "test_findings": test_findings,
                 },
             )
         )
@@ -355,6 +368,32 @@ def _render_sidebar() -> None:
             key="git_init",
         )
 
+        st.markdown("### 🧪 Auto-execute tests")
+        st.checkbox(
+            "Run pytest after generation (+1 fix iteration)",
+            value=st.session_state.get("auto_execute_tests", False),
+            key="auto_execute_tests",
+            help=(
+                "After the fix pass, run pytest in an isolated venv. If "
+                "tests fail, run an additional fixer pass with the "
+                "failures fed back as findings.\n\n"
+                "Real mode: spawns subprocess, creates fresh venv, "
+                "installs requirements.txt + pytest, runs tests with "
+                "timeout. Adds 30-90s.\n\n"
+                "Demo mode: simulated, instant, deterministic."
+            ),
+        )
+        if (
+            st.session_state.get("auto_execute_tests", False)
+            and not st.session_state.get("demo_mode", False)
+        ):
+            st.warning(
+                "⚠️ Auto-execute will spawn a subprocess and **run "
+                "AI-generated code** in an isolated venv. Default OFF for "
+                "safety; you've turned it ON. Output is sandboxed in tmp "
+                "dirs with 90s timeouts."
+            )
+
         st.markdown("---")
         st.caption(
             "Canopy Wave: [docs](https://canopywave.com/docs/get-started/quick-start) · "
@@ -404,12 +443,16 @@ def _render_idea_input() -> tuple[str, bool]:
 # ─── main panel: progress ─────────────────────────────────────────────────
 
 
-PHASES = [
+_BASE_PHASES = [
     ("spec", "🧾 Spec", "Product Lead writes the spec"),
     ("plan", "🗺️ Plan", "Architect decomposes into files"),
     ("implement", "⌨️ Implement", "Backend / Frontend / DevOps / QA — in parallel"),
     ("review", "🔍 Review", "Reviewer + Security audit"),
     ("fix", "🩹 Fix", "Implementers revise based on findings"),
+]
+_TEST_PHASES = [
+    ("test", "🧪 Tests", "Run generated tests in isolated venv"),
+    ("retest_fix", "🛠️ Test-fix", "Patch failing tests (only if needed)"),
 ]
 
 
@@ -417,19 +460,35 @@ def _render_progress() -> None:
     st.markdown("## 🛰️ Progress")
     events: list[tuple[str, str]] = st.session_state.events
 
-    phase_states = {p[0]: "pending" for p in PHASES}
+    auto_tests = bool(st.session_state.get("auto_execute_tests", False))
+    phases = list(_BASE_PHASES)
+    if auto_tests:
+        phases = phases + _TEST_PHASES
+
+    phase_states = {p[0]: "pending" for p in phases}
     for ev_name, _ in events:
-        for p, _, _ in PHASES:
+        for p, _, _ in phases:
             if ev_name.startswith(p):
                 if ev_name.endswith(".start"):
                     phase_states[p] = "running"
                 elif ev_name.endswith(".done"):
                     phase_states[p] = "done"
+                elif ev_name.endswith(".failed"):
+                    phase_states[p] = "failed"
+                elif ev_name.endswith(".skipped"):
+                    phase_states[p] = "skipped"
 
-    cols = st.columns(len(PHASES))
-    for col, (p, label, desc) in zip(cols, PHASES, strict=False):
+    glyph_map = {
+        "pending": "⬜",
+        "running": "🟡",
+        "done": "✅",
+        "failed": "❌",
+        "skipped": "⏭️",
+    }
+    cols = st.columns(len(phases))
+    for col, (p, label, desc) in zip(cols, phases, strict=False):
         state = phase_states[p]
-        glyph = {"pending": "⬜", "running": "🟡", "done": "✅"}[state]
+        glyph = glyph_map[state]
         with col:
             st.markdown(f"### {glyph} {label}")
             st.caption(desc)
@@ -481,7 +540,15 @@ def _render_results() -> None:
     except Exception as e:  # noqa: BLE001
         st.warning(f"Could not build ZIP: {e}")
 
-    tabs = st.tabs(["📁 Files", "📜 Spec", "🗺️ Plan", "🔎 Findings", "📰 Run log"])
+    test_run: TestRunResult | None = result.get("test_run")
+    test_findings: list[Finding] = result.get("test_findings", [])
+    has_tests = test_run is not None
+
+    tab_labels = ["📁 Files", "📜 Spec", "🗺️ Plan", "🔎 Findings"]
+    if has_tests:
+        tab_labels.append("🧪 Tests")
+    tab_labels.append("📰 Run log")
+    tabs = st.tabs(tab_labels)
 
     # Files tab
     with tabs[0]:
@@ -527,8 +594,43 @@ def _render_results() -> None:
                     where = f.file + (f":{f.line}" if f.line else "")
                     st.markdown(f"- `{where}` · `{f.rule}` — {f.message}")
 
+    # Tests tab (only if we have test results)
+    runlog_idx = 4
+    if has_tests:
+        with tabs[4]:
+            assert test_run is not None
+            if not test_run.ran:
+                st.info(
+                    f"⏭️ Test phase was skipped: {test_run.skip_reason or 'unknown'}"
+                )
+            elif test_run.passed:
+                st.success(
+                    f"✅ All tests passed (exit={test_run.exit_code}, "
+                    f"{test_run.duration_s:.1f}s)"
+                )
+            else:
+                st.error(
+                    f"❌ Tests failed (exit={test_run.exit_code}, "
+                    f"{len(test_run.failures)} failure(s), "
+                    f"{test_run.duration_s:.1f}s)"
+                )
+                for tf in test_run.failures:
+                    st.markdown(
+                        f"- `{tf.file_path}::{tf.test_name}` — {tf.error_excerpt}"
+                    )
+                if test_findings:
+                    st.markdown(
+                        f"**Fed back to implementers as {len(test_findings)} "
+                        f"finding(s).** A second-pass fix iteration ran on "
+                        f"these failures."
+                    )
+            if test_run.raw_output:
+                with st.expander("pytest output (last ~10kb)", expanded=False):
+                    st.code(test_run.raw_output, language="text")
+        runlog_idx = 5
+
     # Run log
-    with tabs[4]:
+    with tabs[runlog_idx]:
         for ev, detail in st.session_state.events:
             st.text(f"{ev:<30}  {detail}")
 
@@ -573,9 +675,10 @@ def main() -> None:
 
         do_git = bool(st.session_state.get("git_init", True))
         demo_mode = bool(st.session_state.get("demo_mode", False))
+        auto_tests = bool(st.session_state.get("auto_execute_tests", False))
         t = threading.Thread(
             target=_worker_target,
-            args=(config, idea, do_git, demo_mode, q),
+            args=(config, idea, do_git, demo_mode, auto_tests, q),
             daemon=True,
         )
         t.start()

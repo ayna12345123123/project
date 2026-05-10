@@ -7,7 +7,9 @@ does NOT make routing decisions.
 
 Pipeline (single linear chain; Chief handles parallelism inside each node):
 
-    INTAKE → SPEC → PLAN → IMPLEMENT → REVIEW → FIX → DONE
+    INTAKE → SPEC → PLAN → IMPLEMENT → REVIEW → FIX
+        ↓ (only if a test_runner was provided)
+    TEST → RETEST_FIX → DONE
 
 Every node is a one-line delegate to a Chief method. Roles never appear
 in this file. If you need to add a role, add it to Chief — never wire it
@@ -28,6 +30,7 @@ from .schemas import (
     GeneratedFile,
     Plan,
     Spec,
+    TestRunResult,
 )
 
 logger = logging.getLogger(__name__)
@@ -40,6 +43,8 @@ class OrgState(TypedDict, total=False):
     files_v1: list[GeneratedFile]
     findings: list[Finding]
     files_final: list[GeneratedFile]
+    test_run: TestRunResult | None
+    test_findings: list[Finding]
     notes: list[str]
     _chief_state: ChiefState  # internal: passed between nodes
 
@@ -48,10 +53,21 @@ class OrgState(TypedDict, total=False):
 ProgressFn = Callable[[str, str], Awaitable[None] | None]
 
 
-def build_workflow(client: Any, progress: ProgressFn | None = None):
-    """Compile a LangGraph state machine that delegates to a single Chief."""
+def build_workflow(
+    client: Any,
+    progress: ProgressFn | None = None,
+    test_runner: Any | None = None,
+):
+    """Compile a LangGraph state machine that delegates to a single Chief.
 
-    chief = ChiefOrchestrator(client=client, progress=progress)
+    If ``test_runner`` is provided, two extra nodes are added at the end:
+    ``do_test`` (always runs) and ``do_retest_fix`` (only does work if
+    the test phase produced failures).
+    """
+
+    chief = ChiefOrchestrator(
+        client=client, progress=progress, test_runner=test_runner
+    )
 
     async def node_intake(state: OrgState) -> OrgState:
         chief_state = ChiefState(idea=state["idea"])
@@ -86,6 +102,22 @@ def build_workflow(client: Any, progress: ProgressFn | None = None):
         await chief.do_fix(cs)
         return {"_chief_state": cs, "files_final": list(cs.files_final)}
 
+    async def node_test(state: OrgState) -> OrgState:
+        cs = state["_chief_state"]
+        await chief.do_execute_tests(cs)
+        return {
+            "_chief_state": cs,
+            "test_run": cs.test_run,
+            "test_findings": list(cs.test_findings),
+        }
+
+    async def node_retest_fix(state: OrgState) -> OrgState:
+        cs = state["_chief_state"]
+        if cs.test_run is None or cs.test_run.passed or not cs.test_run.ran:
+            return {"_chief_state": cs, "files_final": list(cs.files_final)}
+        await chief.do_fix_from_tests(cs)
+        return {"_chief_state": cs, "files_final": list(cs.files_final)}
+
     graph = StateGraph(OrgState)
     graph.add_node("do_intake", node_intake)
     graph.add_node("do_spec", node_spec)
@@ -100,7 +132,15 @@ def build_workflow(client: Any, progress: ProgressFn | None = None):
     graph.add_edge("do_plan", "do_implement")
     graph.add_edge("do_implement", "do_review")
     graph.add_edge("do_review", "do_fix")
-    graph.add_edge("do_fix", END)
+
+    if test_runner is not None:
+        graph.add_node("do_test", node_test)
+        graph.add_node("do_retest_fix", node_retest_fix)
+        graph.add_edge("do_fix", "do_test")
+        graph.add_edge("do_test", "do_retest_fix")
+        graph.add_edge("do_retest_fix", END)
+    else:
+        graph.add_edge("do_fix", END)
 
     return graph.compile()
 
@@ -109,6 +149,7 @@ async def run_workflow(
     client: Any,
     idea: str,
     progress: ProgressFn | None = None,
+    test_runner: Any | None = None,
 ) -> OrgState:
     """Top-level convenience: run the full pipeline for a single idea.
 
@@ -118,7 +159,7 @@ async def run_workflow(
     need to know about ChiefState.
     """
 
-    app = build_workflow(client, progress)
+    app = build_workflow(client, progress, test_runner=test_runner)
     final_state = await app.ainvoke({"idea": idea})
 
     # Strip the internal Chief state from the public return value.
