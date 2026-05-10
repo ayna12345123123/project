@@ -92,3 +92,44 @@ class FixOutput(BaseModel):
         default_factory=list,
         description="Findings explicitly NOT addressed, with reasoning",
     )
+
+
+class TestFailure(BaseModel):
+    """A single failing test captured from pytest output."""
+
+    # Tell pytest this is NOT a test class (the "Test" prefix triggers collection).
+    __test__ = False
+
+    test_name: str = Field(
+        description="Pytest node id, e.g. 'tests/test_foo.py::test_bar'"
+    )
+    file_path: str = Field(description="Test file path inside the project")
+    error_excerpt: str = Field(
+        default="",
+        description="Short excerpt from pytest output describing the failure",
+    )
+
+
+class TestRunResult(BaseModel):
+    """Outcome of running the generated test suite in an isolated environment."""
+
+    __test__ = False
+
+    ran: bool = Field(
+        description="True if pytest actually executed (False = skipped/setup error)"
+    )
+    passed: bool = Field(description="True if all executed tests passed")
+    skip_reason: str | None = Field(
+        default=None,
+        description="If ran=False, why the run was skipped (no tests / install failed / timeout)",
+    )
+    failures: list[TestFailure] = Field(default_factory=list)
+    raw_output: str = Field(
+        default="", description="Last ~10kb of combined stdout+stderr"
+    )
+    duration_s: float = Field(
+        default=0.0, description="Wall-clock time for the entire phase"
+    )
+    exit_code: int | None = Field(
+        default=None, description="pytest exit code, when available"
+    )

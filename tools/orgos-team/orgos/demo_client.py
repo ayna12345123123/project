@@ -35,6 +35,8 @@ from .schemas import (
     PlannedFile,
     ReviewOutput,
     Spec,
+    TestFailure,
+    TestRunResult,
 )
 
 logger = logging.getLogger(__name__)
@@ -405,3 +407,59 @@ class DemoLLMClient:
 
     async def close(self) -> None:
         return None
+
+
+class DemoTestRunner:
+    """Stand-in for :class:`orgos.test_runner.TestRunner` — never spawns subprocesses.
+
+    Returns a deterministic :class:`TestRunResult`. By default every call
+    succeeds; if you construct it with ``fail_first_run=True`` the first
+    call returns one canned failure (so you can demo the test → fix
+    iteration without touching real code).
+    """
+
+    # Tell pytest this is NOT a test class (the "Test" suffix triggers collection on some versions).
+    __test__ = False
+
+    def __init__(
+        self,
+        *,
+        per_call_delay: float = 0.3,
+        fail_first_run: bool = False,
+    ) -> None:
+        self.per_call_delay = per_call_delay
+        self.fail_first_run = fail_first_run
+        self._call_count = 0
+
+    async def run(self, files: list[GeneratedFile]) -> TestRunResult:
+        self._call_count += 1
+        if self.per_call_delay > 0:
+            await asyncio.sleep(self.per_call_delay)
+
+        if self.fail_first_run and self._call_count == 1:
+            return TestRunResult(
+                ran=True,
+                passed=False,
+                exit_code=1,
+                failures=[
+                    TestFailure(
+                        test_name="test_default_greeting",
+                        file_path="tests/test_greet.py",
+                        error_excerpt=(
+                            "AssertionError: expected 'Hello, world!' "
+                            "got 'Hi, world!'"
+                        ),
+                    ),
+                ],
+                raw_output="(simulated test failure for demo)\n",
+                duration_s=0.3,
+            )
+
+        return TestRunResult(
+            ran=True,
+            passed=True,
+            exit_code=0,
+            failures=[],
+            raw_output="==== 3 passed in 0.04s ====\n",
+            duration_s=0.3,
+        )

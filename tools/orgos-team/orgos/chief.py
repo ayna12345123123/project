@@ -58,6 +58,7 @@ from .schemas import (
     Plan,
     ReviewOutput,
     Spec,
+    TestRunResult,
 )
 
 logger = logging.getLogger(__name__)
@@ -81,6 +82,15 @@ class _ClientProto(Protocol):
         ...
 
 
+class _TestRunnerProto(Protocol):
+    """Minimal test runner interface Chief optionally depends on."""
+
+    async def run(
+        self, files: list[GeneratedFile]
+    ) -> TestRunResult:  # pragma: no cover - protocol
+        ...
+
+
 @dataclass
 class ChiefState:
     """The single source of truth, owned by Chief, never shared with roles."""
@@ -91,6 +101,8 @@ class ChiefState:
     files_v1: list[GeneratedFile] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
     files_final: list[GeneratedFile] = field(default_factory=list)
+    test_run: TestRunResult | None = None
+    test_findings: list[Finding] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -102,6 +114,8 @@ class ChiefState:
             "files_v1": list(self.files_v1),
             "findings": list(self.findings),
             "files_final": list(self.files_final),
+            "test_run": self.test_run,
+            "test_findings": list(self.test_findings),
             "notes": list(self.notes),
         }
 
@@ -118,9 +132,11 @@ class ChiefOrchestrator:
         self,
         client: _ClientProto,
         progress: ProgressFn | None = None,
+        test_runner: _TestRunnerProto | None = None,
     ) -> None:
         self.client = client
         self.progress = progress
+        self.test_runner = test_runner
 
     # ── routing primitives ──────────────────────────────────────────────
 
@@ -253,6 +269,118 @@ class ChiefOrchestrator:
         state.files_final = final
         await self._emit("fix.done", f"final has {len(final)} files")
 
+    # ── optional auto-execute-tests phase ───────────────────────────────
+
+    async def do_execute_tests(self, state: ChiefState) -> None:
+        """Run the generated test suite in an isolated environment.
+
+        Only invoked if a ``test_runner`` was provided. Result lands in
+        ``state.test_run``; if any tests failed, they're also converted
+        into ``state.test_findings`` (severity=block, rule=TEST_FAIL)
+        for the next fixer pass to consume.
+        """
+        assert self.test_runner is not None, "Chief invariant: test runner required"
+        await self._route(
+            "implementers", "test_runner", "execute pytest in isolated venv"
+        )
+        await self._emit(
+            "test.start", "Running generated tests in isolated venv…"
+        )
+
+        result = await self.test_runner.run(state.files_final)
+        state.test_run = result
+
+        if not result.ran:
+            await self._emit(
+                "test.skipped", f"Skipped: {result.skip_reason or 'unknown reason'}"
+            )
+            return
+        if result.passed:
+            await self._emit(
+                "test.done",
+                f"All tests passed (exit={result.exit_code}, {result.duration_s:.1f}s)",
+            )
+            return
+
+        # Convert each TestFailure into a Finding the fixer agent can consume.
+        test_findings: list[Finding] = []
+        for tf in result.failures:
+            test_findings.append(
+                Finding(
+                    file=tf.file_path,
+                    severity="block",
+                    line=None,
+                    rule="TEST_FAIL",
+                    message=f"{tf.test_name} — {tf.error_excerpt}".strip(" —"),
+                )
+            )
+        # If parsing didn't find specific failures but exit_code != 0,
+        # synthesize a single catch-all finding so the fixer still gets context.
+        if not test_findings:
+            test_findings.append(
+                Finding(
+                    file="(test suite)",
+                    severity="block",
+                    line=None,
+                    rule="TEST_FAIL",
+                    message=(
+                        f"pytest exited non-zero ({result.exit_code}). "
+                        f"Last output: {result.raw_output[-1000:]}"
+                    ),
+                )
+            )
+        state.test_findings = test_findings
+        await self._emit(
+            "test.failed",
+            f"{len(test_findings)} test failure(s) captured (exit={result.exit_code})",
+        )
+
+    async def do_fix_from_tests(self, state: ChiefState) -> None:
+        """Re-run the implementers, this time with test failures as findings."""
+        assert state.spec is not None and state.plan is not None
+        await self._route(
+            "test_runner",
+            "implementers",
+            f"third pass on {len(state.test_findings)} test failures",
+        )
+        await self._emit(
+            "retest_fix.start", "Implementers patching failing tests in parallel…"
+        )
+
+        async def one(domain: Domain) -> list[GeneratedFile]:
+            assert state.spec is not None and state.plan is not None
+            domain_files = [f for f in state.files_final if f.owner == domain]
+            out: FixOutput = await run_fixer(
+                self.client,
+                state.spec,
+                state.plan,
+                domain,
+                domain_files,
+                state.test_findings,
+            )
+            await self._emit(
+                "retest_fix.domain.done",
+                f"{domain}: addressed {len(out.addressed_findings)}, "
+                f"deferred {len(out.deferred_findings)}",
+            )
+            return out.files
+
+        results = await asyncio.gather(*(one(d) for d in DOMAINS))
+        merged: list[GeneratedFile] = []
+        for fs in results:
+            merged.extend(fs)
+        # Defensive merge: keep any prior file the fixer dropped.
+        seen = {f.path for f in merged}
+        for f in state.files_final:
+            if f.path not in seen:
+                merged.append(f)
+
+        state.files_final = merged
+        await self._emit(
+            "retest_fix.done",
+            f"final has {len(merged)} files (after test-fix iteration)",
+        )
+
     # ── top-level entrypoint ────────────────────────────────────────────
 
     async def run(self, idea: str) -> ChiefState:
@@ -265,6 +393,14 @@ class ChiefOrchestrator:
             await self.do_implement(state)
             await self.do_review(state)
             await self.do_fix(state)
+            if self.test_runner is not None:
+                await self.do_execute_tests(state)
+                if (
+                    state.test_run is not None
+                    and state.test_run.ran
+                    and not state.test_run.passed
+                ):
+                    await self.do_fix_from_tests(state)
             await self._emit("chief.done", "Pipeline complete")
             return state
         except Exception as e:

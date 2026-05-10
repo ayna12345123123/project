@@ -13,6 +13,7 @@ import typer
 from .config import Config
 from .llm import LLMClient, LLMError
 from .output import git_init_and_commit, write_project
+from .test_runner import TestRunner
 from .ui import ProgressDisplay, print_banner, print_error, print_summary
 from .workflow import run_workflow
 
@@ -41,6 +42,16 @@ def main(
         "--git-init/--no-git-init",
         help="Run `git init` + initial commit inside the generated project.",
     ),
+    auto_execute_tests: bool = typer.Option(
+        False,
+        "--auto-execute-tests/--no-auto-execute-tests",
+        help=(
+            "After the fix pass, materialize the project into a temporary "
+            "directory, install dependencies in an isolated venv, and run "
+            "pytest. If tests fail, run an additional fixer pass with the "
+            "failures fed back as findings. Adds 30-90s in real mode."
+        ),
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logs."),
 ) -> None:
     """Generate a complete project from a free-form idea."""
@@ -63,7 +74,7 @@ def main(
     progress = ProgressDisplay()
 
     try:
-        final_state = asyncio.run(_run(config, idea, progress))
+        final_state = asyncio.run(_run(config, idea, progress, auto_execute_tests))
     except LLMError as e:
         print_error(f"LLM call failed: {e}")
         raise typer.Exit(code=1) from e
@@ -93,10 +104,16 @@ def main(
     print_summary(str(project_root), file_count=len(files_final), finding_count=len(findings))
 
 
-async def _run(config: Config, idea: str, progress: ProgressDisplay):
+async def _run(
+    config: Config,
+    idea: str,
+    progress: ProgressDisplay,
+    auto_execute_tests: bool,
+):
     client = LLMClient(config)
+    runner = TestRunner() if auto_execute_tests else None
     try:
-        return await run_workflow(client, idea, progress)
+        return await run_workflow(client, idea, progress, test_runner=runner)
     finally:
         await client.close()
 
