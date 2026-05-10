@@ -64,6 +64,31 @@ cp .env.example .env
 
 ## Запуск
 
+Два способа: **Web UI** или **CLI**. Делают одно и то же.
+
+### Web UI (Streamlit) — рекомендуется
+
+```bash
+make ui
+# или вручную:
+streamlit run ui_app.py
+```
+
+Откроется на http://localhost:8501. Что внутри:
+
+- **Sidebar** — API ключ (можно переопределить .env), модель по умолчанию + per-role оверрайды, ползунки concurrency/temperature, выбор output dir.
+- **Главное окно** — text-area для идеи + кнопки-примеры (`Telegram bot — expense tracker`, `FastAPI URL shortener`, `CLI markdown→PDF`, `Discord moderator bot`) которые подставляют готовый текст.
+- **Прогресс** — лайв-стрим событий по 5 фазам (Spec / Plan / Implement / Review / Fix), с цветными статусами (`⬜ pending` / `🟡 running` / `✅ done`). Прогресс не блокирует UI: workflow крутится в background thread, а основной thread Streamlit поллит очередь событий.
+- **Результат** — 5 вкладок:
+  - **Files** — file-picker + подсветка синтаксиса для всех сгенерированных файлов
+  - **Spec** — JSON-viewer
+  - **Plan** — дерево файлов с владельцами + setup/run команды
+  - **Findings** — список с цветовыми бейджами по severity (block/major/minor/nit)
+  - **Run log** — полный stream событий от агентов
+- **Download as .zip** — кнопка скачивает весь сгенерированный проект одним архивом.
+
+### CLI
+
 ```bash
 python -m orgos "Telegram-бот для учёта расходов на aiogram + Postgres"
 ```
@@ -86,6 +111,16 @@ python -m orgos --help
   --output-dir      переопределить ORGOS_OUTPUT_DIR
   --git-init/--no-git-init   делать ли git init (по умолчанию yes)
   --verbose, -v     debug-логи
+```
+
+### Makefile-шорткаты
+
+```bash
+make install   # python -m venv + pip install -r requirements.txt
+make ui        # streamlit run ui_app.py
+make cli IDEA="ваша идея"   # python -m orgos "ваша идея"
+make test      # pytest
+make clean     # удалить .venv, кеши
 ```
 
 ---
@@ -165,8 +200,10 @@ ORGOS_MODEL_SECURITY=moonshotai/kimi-k2-thinking
 tools/orgos-team/
 ├── .env.example
 ├── .gitignore
+├── Makefile               # make install / make ui / make cli IDEA="…" / make test
 ├── README.md
 ├── requirements.txt
+├── ui_app.py              # Streamlit web UI (опционально)
 ├── orgos/
 │   ├── __init__.py
 │   ├── __main__.py        # CLI вход
@@ -193,6 +230,25 @@ tools/orgos-team/
     ├── reviewer.md
     └── security.md
 ```
+
+---
+
+## Web UI: внутренности (для тех кто хочет править)
+
+`ui_app.py` — один файл Streamlit-приложения. Ключевые моменты:
+
+- **Background thread + queue.Queue** для прогресса. Streamlit-главный поток не умеет async-await напрямую (любой долгий sync-вызов фризит UI). Поэтому:
+  ```
+  Click "Generate" → spawn threading.Thread(target=_worker_target, ...)
+                  → worker запускает asyncio.new_event_loop() и run_until_complete(workflow)
+                  → каждое progress-событие пишется в queue.Queue
+                  → главный поток поллит queue, рендерит UI, делает st.rerun() каждые 0.5с
+                  → когда worker кладёт ('done', state) — стопаем поллинг и рендерим results
+  ```
+- **st.session_state** хранит весь стейт между rerun'ами: `events`, `result`, `error`, `worker`, `event_queue`, `status` ∈ `{idle, running, done, error}`.
+- **Sidebar overrides** перед запуском записываются в `os.environ` и затем `Config.load()` их подхватывает — никакого дублирующего конфиг-кода.
+- **ZIP-download** строится на лету через `io.BytesIO()` + `zipfile.ZipFile`.
+- **Подсветка синтаксиса** через `st.code(content, language=…)` где `language` определяется по расширению файла.
 
 ---
 
