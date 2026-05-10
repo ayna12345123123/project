@@ -52,7 +52,7 @@ class Config:
             "CANOPYWAVE_BASE_URL", "https://inference.canopywave.io/v1"
         ).strip()
         default_model = os.environ.get(
-            "ORGOS_DEFAULT_MODEL", "moonshotai/kimi-k2-thinking"
+            "ORGOS_DEFAULT_MODEL", "moonshotai/kimi-k2.6"
         ).strip()
 
         role_models: dict[str, str] = {}

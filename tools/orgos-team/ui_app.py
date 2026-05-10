@@ -30,6 +30,7 @@ from typing import Any
 import streamlit as st
 
 from orgos.config import Config
+from orgos.demo_client import DemoLLMClient
 from orgos.llm import LLMClient, LLMError
 from orgos.output import git_init_and_commit, write_project
 from orgos.schemas import Finding, GeneratedFile, Plan, Spec
@@ -77,15 +78,25 @@ def _worker_target(
     config: Config,
     idea: str,
     do_git_init: bool,
+    demo_mode: bool,
     event_q: "queue.Queue[tuple[str, Any]]",
 ) -> None:
-    """Run the async workflow in a background thread."""
+    """Run the async workflow in a background thread.
+
+    If ``demo_mode`` is True, swap in :class:`DemoLLMClient` so we never
+    touch the network. Everything downstream — Chief, agents, schemas,
+    output writer — is unchanged.
+    """
 
     def progress(event: str, detail: str) -> None:
         event_q.put(("progress", (event, detail)))
 
     async def _go() -> dict[str, Any]:
-        client = LLMClient(config)
+        client: Any
+        if demo_mode:
+            client = DemoLLMClient()
+        else:
+            client = LLMClient(config)
         try:
             return await run_workflow(client, idea, progress)
         finally:
@@ -232,16 +243,22 @@ def _build_config_from_sidebar() -> Config | None:
         api_key = env_key
 
     if not api_key:
-        st.error(
-            "No CANOPYWAVE_API_KEY provided. "
-            "Either paste it in the sidebar or put it in `.env` next to this app."
-        )
-        return None
+        # In demo mode we don't need a real key, but Config.load() still
+        # demands SOMETHING in the env. Use a placeholder.
+        if st.session_state.get("demo_mode", False):
+            api_key = "demo-mode-no-network-calls"
+        else:
+            st.error(
+                "No CANOPYWAVE_API_KEY provided. "
+                "Either paste it in the sidebar or put it in `.env` next to this app, "
+                "or enable 🎭 Demo mode in the sidebar."
+            )
+            return None
 
     os.environ["CANOPYWAVE_API_KEY"] = api_key
 
     # apply per-role overrides into env so Config.load picks them up
-    default_model = st.session_state.get("default_model", "moonshotai/kimi-k2-thinking").strip()
+    default_model = st.session_state.get("default_model", "moonshotai/kimi-k2.6").strip()
     os.environ["ORGOS_DEFAULT_MODEL"] = default_model
 
     for role in (
@@ -280,18 +297,34 @@ def _build_config_from_sidebar() -> Config | None:
 
 def _render_sidebar() -> None:
     with st.sidebar:
+        st.markdown("### 🎭 Demo mode")
+        st.checkbox(
+            "Demo mode (no API calls)",
+            value=st.session_state.get("demo_mode", False),
+            key="demo_mode",
+            help=(
+                "Replace the LLM client with a deterministic stub. The full "
+                "5-phase pipeline runs in ~3 seconds and produces a real, "
+                "runnable demo project. Useful for onboarding, demos, and "
+                "trying the UI without an API key."
+            ),
+        )
+        if st.session_state.get("demo_mode", False):
+            st.info("🎭 Demo mode is ON — no network, no tokens spent.")
+
         st.markdown("### 🔑 API")
         st.text_input(
             "CANOPYWAVE_API_KEY",
             type="password",
             placeholder="Leave empty to use .env",
             key="api_key",
+            disabled=st.session_state.get("demo_mode", False),
         )
 
         st.markdown("### 🧠 Models")
         st.text_input(
             "Default model (all roles)",
-            value=st.session_state.get("default_model", "moonshotai/kimi-k2-thinking"),
+            value=st.session_state.get("default_model", "moonshotai/kimi-k2.6"),
             key="default_model",
         )
         with st.expander("Per-role overrides", expanded=False):
@@ -325,7 +358,7 @@ def _render_sidebar() -> None:
         st.markdown("---")
         st.caption(
             "Canopy Wave: [docs](https://canopywave.com/docs/get-started/quick-start) · "
-            "[models](https://canopywave.com/docs/kimi-k2-thinking)"
+            "[models](https://canopywave.com/docs/kimi-k2.6)"
         )
 
 
@@ -511,6 +544,14 @@ def main() -> None:
     )
 
     _render_sidebar()
+
+    if st.session_state.get("demo_mode", False):
+        st.warning(
+            "🎭 **Demo mode is active.** No LLM calls will be made. "
+            "Output is a deterministic demo project (`hello` CLI) so you can "
+            "see the full UI flow without an API key."
+        )
+
     idea, submit = _render_idea_input()
 
     if submit:
@@ -531,9 +572,10 @@ def main() -> None:
         st.session_state.event_queue = q
 
         do_git = bool(st.session_state.get("git_init", True))
+        demo_mode = bool(st.session_state.get("demo_mode", False))
         t = threading.Thread(
             target=_worker_target,
-            args=(config, idea, do_git, q),
+            args=(config, idea, do_git, demo_mode, q),
             daemon=True,
         )
         t.start()

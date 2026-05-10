@@ -1,7 +1,7 @@
 # orgos-team — автономная AI-команда из 8 агентов
 
 Минимальный, но работающий мульти-агентный генератор проектов на базе
-**Canopy Wave** (модель `moonshotai/kimi-k2-thinking` по умолчанию). Принимает
+**Canopy Wave** (модель `moonshotai/kimi-k2.6` по умолчанию). Принимает
 описание идеи на любом языке и пишет полноценный код проекта в `output/<slug>/`.
 
 > **Это MVP**, а не "автономная инженерная организация" из `ARCHITECTURE.md`.
@@ -11,35 +11,64 @@
 
 ## Архитектура за 30 секунд
 
+**Hub-and-spoke.** Все агенты общаются ТОЛЬКО через одного главного — `ChiefOrchestrator`.
+Никакого прямого обращения "агент → агент" не существует физически: агенты не импортируют
+друг друга, не имеют ссылок друг на друга, не передают друг другу сообщения. Каждый
+переход роль → роль проходит через `Chief._route(...)` и логируется как событие
+`chief.route` (видно в Web UI Run log и в CLI логах).
+
+```
+                       ┌───────────────────────┐
+                       │   ChiefOrchestrator   │
+                       │   (единственный hub)  │
+                       └──┬──┬──┬──┬──┬────────┘
+              ┌───────────┘  │  │  │  └────────┐
+              ▼              ▼  ▼  ▼           ▼
+         Product       Architect  │       Reviewer
+                                  │       Security
+                                  ▼
+                  ┌─────────┬─────┴─────┬──────────┐
+                  ▼         ▼           ▼          ▼
+               Backend  Frontend     DevOps        QA
+              (impl/fix)(impl/fix) (impl/fix)  (impl/fix)
+```
+
+Поток данных:
+
 ```
         idea (любой язык)
               │
-              ▼
+              ▼  Chief.do_spec  → Product
         ┌───────────┐
-        │  Product  │  пишет Spec
+        │  Product  │  пишет Spec → возвращает Chief'у
         └─────┬─────┘
-              ▼
+              ▼  Chief.do_plan  → Architect
         ┌───────────┐
-        │ Architect │  пишет Plan: список файлов + кто их пишет
+        │ Architect │  пишет Plan → возвращает Chief'у
         └─────┬─────┘
-              ▼
+              ▼  Chief.do_implement  → 4 implementer'а параллельно
    ┌──────────┴──────────┐
    ▼          ▼          ▼          ▼
-Backend   Frontend   DevOps     QA       (4 параллельно — пишут v1)
+Backend   Frontend   DevOps     QA      → возвращают v1 файлы Chief'у
    └──────────┬──────────┘
-              ▼
+              ▼  Chief.do_review  → Reviewer + Security параллельно
         ┌───────────┐
-        │ Reviewer  │  ┐
-        │ Security  │  │ ← (2 параллельно)  → собирают findings
+        │ Reviewer  │
+        │ Security  │  → возвращают findings Chief'у
         └─────┬─────┘
-              ▼
+              ▼  Chief.do_fix  → 4 fixer'а параллельно
    ┌──────────┴──────────┐
    ▼          ▼          ▼          ▼
-Backend   Frontend   DevOps     QA       (4 параллельно — пишут v2 с фиксами)
+Backend   Frontend   DevOps     QA      → возвращают v2 Chief'у
    └──────────┬──────────┘
-              ▼
-        write to disk + git init + initial commit
+              ▼  Chief пишет на диск + git init
 ```
+
+**Важные инварианты** (тестируются в `tests/test_chief.py`):
+- ровно 5 типов inter-role transitions (`idea→product`, `product→architect`,
+  `architect→implementers`, `implementers→reviewers`, `reviewers→implementers`);
+- ни один файл агента не импортирует другого агента;
+- весь стейт (`ChiefState`) принадлежит Chief'у — агенты не имеют разделяемой памяти.
 
 8 агентов, 1 LangGraph state machine, ~14 LLM-вызовов на проект.
 
@@ -76,6 +105,10 @@ streamlit run ui_app.py
 
 Откроется на http://localhost:8501. Что внутри:
 
+- **🎭 Demo mode** (чекбокс в sidebar) — запускает весь конвейер на детерминированном
+  стабе вместо настоящего LLM. **Никаких сетевых вызовов, никакого ключа не нужно.**
+  За ~3 секунды генерируется реальный, запускаемый демо-проект (Python CLI `hello`).
+  Полезно для онбординга, скриншотов, скринкастов и быстрой итерации над самим UI.
 - **Sidebar** — API ключ (можно переопределить .env), модель по умолчанию + per-role оверрайды, ползунки concurrency/temperature, выбор output dir.
 - **Главное окно** — text-area для идеи + кнопки-примеры (`Telegram bot — expense tracker`, `FastAPI URL shortener`, `CLI markdown→PDF`, `Discord moderator bot`) которые подставляют готовый текст.
 - **Прогресс** — лайв-стрим событий по 5 фазам (Spec / Plan / Implement / Review / Fix), с цветными статусами (`⬜ pending` / `🟡 running` / `✅ done`). Прогресс не блокирует UI: workflow крутится в background thread, а основной thread Streamlit поллит очередь событий.
@@ -133,7 +166,7 @@ make clean     # удалить .venv, кеши
 |---|---|
 | `CANOPYWAVE_API_KEY` | **Обязательно.** Ключ от Canopy Wave. |
 | `CANOPYWAVE_BASE_URL` | По умолчанию `https://inference.canopywave.io/v1`. |
-| `ORGOS_DEFAULT_MODEL` | Модель для всех агентов. По умолчанию `moonshotai/kimi-k2-thinking`. |
+| `ORGOS_DEFAULT_MODEL` | Модель для всех агентов. По умолчанию `moonshotai/kimi-k2.6`. |
 | `ORGOS_MODEL_<ROLE>` | Переопределение модели на конкретную роль (PRODUCT, ARCHITECT, BACKEND, FRONTEND, DEVOPS, QA, REVIEWER, SECURITY). |
 | `ORGOS_MAX_CONCURRENCY` | Сколько LLM-вызовов параллельно (по умолчанию 4). |
 | `ORGOS_TEMPERATURE` | Temperature для LLM (по умолчанию 0.2). |
@@ -145,9 +178,9 @@ make clean     # удалить .venv, кеши
 
 ```
 ORGOS_DEFAULT_MODEL=qwen/qwen3-coder
-ORGOS_MODEL_ARCHITECT=moonshotai/kimi-k2-thinking
-ORGOS_MODEL_REVIEWER=moonshotai/kimi-k2-thinking
-ORGOS_MODEL_SECURITY=moonshotai/kimi-k2-thinking
+ORGOS_MODEL_ARCHITECT=moonshotai/kimi-k2.6
+ORGOS_MODEL_REVIEWER=moonshotai/kimi-k2.6
+ORGOS_MODEL_SECURITY=moonshotai/kimi-k2.6
 ```
 
 ---
